@@ -367,4 +367,17 @@ console.log('✓ pollSubscriptionTimeout works correctly');
 
 store2.close();
 
+// Test 41: create refuses a path that already holds a store (#34).
+console.log('\n41. Testing create refuses an existing store...');
+let createRefusal = null;
+try {
+  JsStore.create({ path: './test-store' });
+} catch (e) {
+  createRefusal = e.message;
+}
+if (!createRefusal || !createRefusal.includes('already exists')) {
+  throw new Error(`create over an existing store should throw, got: ${createRefusal}`);
+}
+console.log('✓ create refused:', createRefusal);
+
 console.log('\n✅ All tests passed!');

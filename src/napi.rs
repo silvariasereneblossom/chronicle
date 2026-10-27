@@ -358,6 +358,9 @@ impl JsStore {
     }
 
     /// Create a new store at the given path.
+    /// Throws if the path already holds a store, or any of a store's own
+    /// files, rather than replacing its registrations and branches; open an
+    /// existing store with `open` or `openOrCreate`.
     #[napi(factory)]
     pub fn create(config: JsStoreConfig) -> Result<JsStore> {
         let store_config = StoreConfig {
@@ -387,7 +390,8 @@ impl JsStore {
         })
     }
 
-    /// Open or create a store.
+    /// Open or create a store. A store exists where its MANIFEST does, so a
+    /// directory without one, such as one made ahead of time, gets a new store.
     #[napi(factory)]
     pub fn open_or_create(config: JsStoreConfig) -> Result<JsStore> {
         let store_config = StoreConfig {

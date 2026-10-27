@@ -128,8 +128,11 @@ pub struct Store {
 
 impl Store {
     /// Open an existing store or create a new one.
+    ///
+    /// A store exists where its MANIFEST does, so a directory without one,
+    /// such as a volume made ahead of time, gets a new store.
     pub fn open_or_create(config: StoreConfig) -> Result<Self> {
-        if config.path.exists() {
+        if config.path.join("MANIFEST").exists() {
             Self::open(config)
         } else if config.create_if_missing {
             Self::create(config)
@@ -139,16 +142,29 @@ impl Store {
     }
 
     /// Create a new store.
+    ///
+    /// Refuses a directory that already holds a store, or any of a store's
+    /// own files: creating one there would publish empty state registrations
+    /// and branches over the store's own. Open an existing store instead.
     pub fn create(config: StoreConfig) -> Result<Self> {
         // Create directory structure
         fs::create_dir_all(&config.path)?;
+
+        // Acquire lock before looking for a store, so one that another
+        // process has open is refused as locked, with nothing written to it.
+        let lock_file = Self::acquire_lock(&config.path)?;
+        if let Some(file) = existing_store_file(&config.path) {
+            return Err(StoreError::InvalidOperation(format!(
+                "a store already exists at {} (its {file} is there), so nothing was created: \
+                 open it instead",
+                config.path.display()
+            )));
+        }
+
         fs::create_dir_all(config.path.join("blobs"))?;
 
         // Write manifest
         Self::write_manifest(&config.path)?;
-
-        // Acquire lock
-        let lock_file = Self::acquire_lock(&config.path)?;
 
         // Initialize components
         let log = Arc::new(RecordLog::open(config.path.join("records.log"))?);
@@ -2344,6 +2360,15 @@ impl Store {
 
         Ok(lock_file)
     }
+}
+
+/// The first of a store's own files that `path` holds, if any. A store that
+/// has lost its MANIFEST still has its log and checkpoints, which `create`
+/// would replace.
+fn existing_store_file(path: &Path) -> Option<&'static str> {
+    ["MANIFEST", "records.log", "state.bin", "branches.bin"]
+        .into_iter()
+        .find(|name| fs::symlink_metadata(path.join(name)).is_ok())
 }
 
 /// What a failed `try_lock_exclusive` on LOCK means. fs2 reports another
