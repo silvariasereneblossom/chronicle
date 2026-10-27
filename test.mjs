@@ -380,4 +380,55 @@ if (!createRefusal || !createRefusal.includes('already exists')) {
 }
 console.log('✓ create refused:', createRefusal);
 
+// Test 42: Numeric arguments are range-checked (#27). Each of these used to
+// wrap, and a negative or huge query limit aborted the process.
+console.log('\n42. Testing numeric argument range checks...');
+for (const blobCacheSize of [-1, 2.5]) {
+  let message = null;
+  try {
+    JsStore.open({ path: './test-store', blobCacheSize });
+  } catch (e) {
+    message = e.message;
+  }
+  if (!message || !message.startsWith('Invalid blobCacheSize: ')) {
+    throw new Error(`open with blobCacheSize ${blobCacheSize} should throw, got: ${message}`);
+  }
+}
+const store3 = JsStore.open({ path: './test-store' });
+const subId4 = store3.subscribe({});
+const invalidNumbers = [
+  ['query limit -1', () => store3.query({ limit: -1 }), 'limit'],
+  ['query types limit -1', () => store3.query({ types: ['message'], limit: -1 }), 'limit'],
+  ['query offset -1', () => store3.query({ offset: -1 }), 'offset'],
+  ['query limit 2.5', () => store3.query({ limit: 2.5 }), 'limit'],
+  ['query fromSequence NaN', () => store3.query({ fromSequence: NaN }), 'fromSequence'],
+  ['getStateSlice limit -1', () => store3.getStateSlice('counter', 0, -1), 'limit'],
+  ['getStateTail -1', () => store3.getStateTail('counter', -1), 'count'],
+  ['subscribe bufferSize 1e9', () => store3.subscribe({ bufferSize: 1e9 }), 'bufferSize'],
+  ['pollSubscriptionTimeout -1', () => store3.pollSubscriptionTimeout(subId4, -1), 'timeoutMs'],
+  ['createBranchAt -1', () => store3.createBranchAt('never', 'main', -1), 'atSequence'],
+  [
+    'registerState deltaSnapshotEvery 0',
+    () => store3.registerState({ id: 'never', strategy: 'append_log', deltaSnapshotEvery: 0 }),
+    'deltaSnapshotEvery',
+  ],
+];
+for (const [label, call, name] of invalidNumbers) {
+  let message = null;
+  try {
+    call();
+  } catch (e) {
+    message = e.message;
+  }
+  if (!message || !message.startsWith(`Invalid ${name}: `)) {
+    throw new Error(`${label} should throw "Invalid ${name}: ...", got: ${message}`);
+  }
+}
+store3.unsubscribe(subId4);
+if (store3.query({ limit: 1e15 }).length !== store3.query({}).length) {
+  throw new Error('a limit past the record count should return every record');
+}
+store3.close();
+console.log('✓ Out-of-range numbers throw, and a huge limit means all');
+
 console.log('\n✅ All tests passed!');

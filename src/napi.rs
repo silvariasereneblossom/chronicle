@@ -2,6 +2,7 @@
 
 use crate::{
     error::StoreError,
+    napi_args,
     subscriptions::{
         DropReason, RecordSummary, StoreEvent, SubscriptionConfig, SubscriptionFilter,
         SubscriptionHandle, SubscriptionId,
@@ -110,7 +111,8 @@ pub struct JsUnregisteredState {
 #[napi(object)]
 pub struct JsStoreConfig {
     pub path: String,
-    pub blob_cache_size: Option<i64>,
+    /// A non-negative integer.
+    pub blob_cache_size: Option<f64>,
 }
 
 /// State registration options.
@@ -118,8 +120,10 @@ pub struct JsStoreConfig {
 pub struct JsStateRegistration {
     pub id: String,
     pub strategy: String, // "snapshot" | "append_log"
-    pub delta_snapshot_every: Option<i64>,
-    pub full_snapshot_every: Option<i64>,
+    /// An integer from 1 to 4294967295.
+    pub delta_snapshot_every: Option<f64>,
+    /// An integer from 1 to 4294967295.
+    pub full_snapshot_every: Option<f64>,
     pub initial_value: Option<Buffer>,
 }
 
@@ -159,36 +163,38 @@ pub struct JsRecordOptions {
     pub linked_to: Option<Vec<String>>,
 }
 
-/// Query filter for records.
+/// Query filter for records. The numbers are non-negative integers; a limit
+/// past what the store holds means all of it.
 #[napi(object)]
 pub struct JsQueryFilter {
     pub types: Option<Vec<String>>,
-    pub from_sequence: Option<i64>,
-    pub to_sequence: Option<i64>,
-    pub limit: Option<i64>,
-    pub offset: Option<i64>,
+    pub from_sequence: Option<f64>,
+    pub to_sequence: Option<f64>,
+    pub limit: Option<f64>,
+    pub offset: Option<f64>,
     /// If true, return records in descending sequence order (newest first).
     pub reverse: Option<bool>,
 }
 
 /// Options for a numeric range query against a registered state field index
 /// (see `registerStateFieldIndex`). Either bound may be omitted for an
-/// open-ended range.
+/// open-ended range. `limit` and `offset` are non-negative integers.
 #[napi(object)]
 pub struct JsIndexRangeQuery {
     pub gte: Option<f64>,
     pub lte: Option<f64>,
-    pub limit: Option<u32>,
-    pub offset: Option<u32>,
+    pub limit: Option<f64>,
+    pub offset: Option<f64>,
     /// If true, return ordinals in descending value order.
     pub reverse: Option<bool>,
 }
 
 /// Options for an equality query against a registered state field index.
+/// `limit` and `offset` are non-negative integers.
 #[napi(object)]
 pub struct JsIndexEqQuery {
-    pub limit: Option<u32>,
-    pub offset: Option<u32>,
+    pub limit: Option<f64>,
+    pub offset: Option<f64>,
 }
 
 /// A distinct string field-index value and how many ordinals carry it.
@@ -212,12 +218,14 @@ pub struct JsStateInfo {
 /// Configuration for creating a subscription.
 #[napi(object)]
 pub struct JsSubscriptionConfig {
-    /// Max buffered events before dropping subscriber (default: 1000).
-    pub buffer_size: Option<i64>,
-    /// Max bytes for state snapshots (default: 10MB).
-    pub max_snapshot_bytes: Option<i64>,
-    /// Starting sequence for catch-up (None = live only).
-    pub from_sequence: Option<i64>,
+    /// Max buffered events before dropping subscriber (default: 1000), an
+    /// integer from 1 to 1048576.
+    pub buffer_size: Option<f64>,
+    /// Max bytes for state snapshots (default: 10MB), a non-negative integer.
+    pub max_snapshot_bytes: Option<f64>,
+    /// Starting sequence for catch-up (None = live only), a non-negative
+    /// integer.
+    pub from_sequence: Option<f64>,
     /// Filter criteria.
     pub filter: Option<JsSubscriptionFilter>,
 }
@@ -331,18 +339,70 @@ fn to_napi_error(e: StoreError) -> napi::Error {
     napi::Error::from_reason(e.to_string())
 }
 
+/// A JS number as a count, index, offset or size, or the error naming it
+/// (see `napi_args`).
+fn js_usize(name: &str, value: f64) -> Result<usize> {
+    napi_args::to_usize(name, value).map_err(napi::Error::from_reason)
+}
+
+/// A JS number as a sequence or a duration, or the error naming it (see
+/// `napi_args`).
+fn js_u64(name: &str, value: f64) -> Result<u64> {
+    napi_args::to_u64(name, value).map_err(napi::Error::from_reason)
+}
+
+/// The configured blob cache size, 1000 when not given.
+fn js_blob_cache_size(config: &JsStoreConfig) -> Result<usize> {
+    config
+        .blob_cache_size
+        .map(|size| js_usize("blobCacheSize", size))
+        .transpose()
+        .map(|size| size.unwrap_or(1000))
+}
+
+/// A snapshot cadence, `default` when not given. Capped well below u64 so
+/// the snapshot schedule's products of cadence and snapshot count can't
+/// overflow.
+fn js_cadence(name: &str, value: Option<f64>, default: u64) -> Result<u64> {
+    value
+        .map(|every| {
+            napi_args::to_u64_in(name, every, 1, u32::MAX as u64)
+                .map_err(napi::Error::from_reason)
+        })
+        .transpose()
+        .map(|every| every.unwrap_or(default))
+}
+
+/// A tree entry from JS, refusing a negative size or mode, which would
+/// otherwise wrap to a huge one.
+fn js_tree_entry(entry: JsTreeEntry) -> Result<TreeEntry> {
+    let size = u64::try_from(entry.size).map_err(|_| {
+        napi::Error::from_reason(format!("Invalid size: {} (a non-negative integer)", entry.size))
+    })?;
+    let mode = u32::try_from(entry.mode).map_err(|_| {
+        napi::Error::from_reason(format!("Invalid mode: {} (a non-negative integer)", entry.mode))
+    })?;
+    Ok(TreeEntry {
+        blob_hash: entry.blob_hash,
+        size,
+        mode,
+    })
+}
+
 /// Shared JsStateRegistration -> StateStrategy conversion for
 /// register_state and update_state_strategy.
 fn js_registration_strategy(registration: &JsStateRegistration) -> Result<StateStrategy> {
+    let delta = registration.delta_snapshot_every;
+    let full = registration.full_snapshot_every;
     Ok(match registration.strategy.as_str() {
         "snapshot" => StateStrategy::Snapshot,
         "append_log" => StateStrategy::AppendLog {
-            delta_snapshot_every: registration.delta_snapshot_every.unwrap_or(100) as u64,
-            full_snapshot_every: registration.full_snapshot_every.unwrap_or(10) as u64,
+            delta_snapshot_every: js_cadence("deltaSnapshotEvery", delta, 100)?,
+            full_snapshot_every: js_cadence("fullSnapshotEvery", full, 10)?,
         },
         "tree" => StateStrategy::Tree {
-            delta_snapshot_every: registration.delta_snapshot_every.unwrap_or(50) as u64,
-            full_snapshot_every: registration.full_snapshot_every.unwrap_or(10) as u64,
+            delta_snapshot_every: js_cadence("deltaSnapshotEvery", delta, 50)?,
+            full_snapshot_every: js_cadence("fullSnapshotEvery", full, 10)?,
         },
         _ => return Err(napi::Error::from_reason("Invalid strategy")),
     })
@@ -364,8 +424,8 @@ impl JsStore {
     #[napi(factory)]
     pub fn create(config: JsStoreConfig) -> Result<JsStore> {
         let store_config = StoreConfig {
+            blob_cache_size: js_blob_cache_size(&config)?,
             path: config.path.into(),
-            blob_cache_size: config.blob_cache_size.map(|s| s as usize).unwrap_or(1000),
             create_if_missing: false,
         };
         let store = Store::create(store_config).map_err(to_napi_error)?;
@@ -379,8 +439,8 @@ impl JsStore {
     #[napi(factory)]
     pub fn open(config: JsStoreConfig) -> Result<JsStore> {
         let store_config = StoreConfig {
+            blob_cache_size: js_blob_cache_size(&config)?,
             path: config.path.into(),
-            blob_cache_size: config.blob_cache_size.map(|s| s as usize).unwrap_or(1000),
             create_if_missing: false,
         };
         let store = Store::open(store_config).map_err(to_napi_error)?;
@@ -395,8 +455,8 @@ impl JsStore {
     #[napi(factory)]
     pub fn open_or_create(config: JsStoreConfig) -> Result<JsStore> {
         let store_config = StoreConfig {
+            blob_cache_size: js_blob_cache_size(&config)?,
             path: config.path.into(),
-            blob_cache_size: config.blob_cache_size.map(|s| s as usize).unwrap_or(1000),
             create_if_missing: true,
         };
         let store = Store::open_or_create(store_config).map_err(to_napi_error)?;
@@ -604,10 +664,11 @@ impl JsStore {
     /// This enables time-travel branching - the new branch will have state as of that sequence.
     /// A failed checkpoint leaves the branch in memory, as for `createBranch`.
     #[napi]
-    pub fn create_branch_at(&self, name: String, from: String, at_sequence: i64) -> Result<JsBranch> {
+    pub fn create_branch_at(&self, name: String, from: String, at_sequence: f64) -> Result<JsBranch> {
         let store = self.get_store()?;
+        let at = Sequence(js_u64("atSequence", at_sequence)?);
         let branch = store
-            .create_branch_at(&name, &from, Sequence(at_sequence as u64))
+            .create_branch_at(&name, &from, at)
             .map_err(to_napi_error)?;
         Ok(JsBranch {
             id: branch.id.0.to_string(),
@@ -843,7 +904,7 @@ impl JsStore {
     pub fn edit_state_item(
         &self,
         state_id: String,
-        index: i64,
+        index: f64,
         new_value: Buffer,
     ) -> Result<JsRecord> {
         let store = self.get_store()?;
@@ -851,7 +912,7 @@ impl JsStore {
             .update_state(
                 &state_id,
                 StateOperation::Edit {
-                    index: index as usize,
+                    index: js_usize("index", index)?,
                     new_value: new_value.to_vec(),
                 },
             )
@@ -864,16 +925,16 @@ impl JsStore {
     pub fn redact_state_items(
         &self,
         state_id: String,
-        start: i64,
-        end: i64,
+        start: f64,
+        end: f64,
     ) -> Result<JsRecord> {
         let store = self.get_store()?;
         let record = store
             .update_state(
                 &state_id,
                 StateOperation::Redact {
-                    start: start as usize,
-                    end: end as usize,
+                    start: js_usize("start", start)?,
+                    end: js_usize("end", end)?,
                 },
             )
             .map_err(to_napi_error)?;
@@ -895,12 +956,12 @@ impl JsStore {
     pub fn get_state_slice(
         &self,
         state_id: String,
-        offset: i64,
-        limit: i64,
+        offset: f64,
+        limit: f64,
     ) -> Result<Option<Buffer>> {
         let store = self.get_store()?;
         let slice = store
-            .get_state_slice(&state_id, offset as usize, limit as usize)
+            .get_state_slice(&state_id, js_usize("offset", offset)?, js_usize("limit", limit)?)
             .map_err(to_napi_error)?;
         Ok(slice.map(Buffer::from))
     }
@@ -936,10 +997,10 @@ impl JsStore {
 
     /// Get the last N items from an AppendLog state.
     #[napi]
-    pub fn get_state_tail(&self, state_id: String, count: i64) -> Result<Option<Buffer>> {
+    pub fn get_state_tail(&self, state_id: String, count: f64) -> Result<Option<Buffer>> {
         let store = self.get_store()?;
         let tail = store
-            .get_state_tail(&state_id, count as usize)
+            .get_state_tail(&state_id, js_usize("count", count)?)
             .map_err(to_napi_error)?;
         Ok(tail.map(Buffer::from))
     }
@@ -1086,11 +1147,24 @@ impl JsStore {
     #[napi]
     pub fn query(&self, filter: JsQueryFilter) -> Result<Vec<JsRecord>> {
         let store = self.get_store()?;
-        let from_seq = filter.from_sequence.map(|s| Sequence(s as u64));
-        let to_seq = filter.to_sequence.map(|s| Sequence(s as u64));
-        // Default limit to 10,000 to avoid capacity overflow panics
-        let limit = filter.limit.map(|l| l as usize).unwrap_or(10_000);
-        let offset = filter.offset.map(|o| o as usize).unwrap_or(0);
+        let from_seq = filter
+            .from_sequence
+            .map(|s| js_u64("fromSequence", s).map(Sequence))
+            .transpose()?;
+        let to_seq = filter
+            .to_sequence
+            .map(|s| js_u64("toSequence", s).map(Sequence))
+            .transpose()?;
+        let limit = filter
+            .limit
+            .map(|l| js_usize("limit", l))
+            .transpose()?
+            .unwrap_or(10_000);
+        let offset = filter
+            .offset
+            .map(|o| js_usize("offset", o))
+            .transpose()?
+            .unwrap_or(0);
         let reverse = filter.reverse.unwrap_or(false);
         let types = filter.types;
 
@@ -1170,10 +1244,11 @@ impl JsStore {
 
     /// Get state value at a specific sequence (historical access).
     #[napi]
-    pub fn get_state_at(&self, state_id: String, at_sequence: i64) -> Result<Option<Buffer>> {
+    pub fn get_state_at(&self, state_id: String, at_sequence: f64) -> Result<Option<Buffer>> {
         let store = self.get_store()?;
+        let at = Sequence(js_u64("atSequence", at_sequence)?);
         let state = store
-            .get_state_at(&state_id, Sequence(at_sequence as u64))
+            .get_state_at(&state_id, at)
             .map_err(to_napi_error)?;
         Ok(state.map(Buffer::from))
     }
@@ -1183,11 +1258,12 @@ impl JsStore {
     pub fn get_state_json_at(
         &self,
         state_id: String,
-        at_sequence: i64,
+        at_sequence: f64,
     ) -> Result<Option<serde_json::Value>> {
         let store = self.get_store()?;
+        let at = Sequence(js_u64("atSequence", at_sequence)?);
         let state = store
-            .get_state_at(&state_id, Sequence(at_sequence as u64))
+            .get_state_at(&state_id, at)
             .map_err(to_napi_error)?;
         match state {
             Some(bytes) => {
@@ -1273,13 +1349,26 @@ impl JsStore {
                     include_branch_events: f.include_branch_events.unwrap_or(false),
                 });
 
+                let max_buffer = SubscriptionConfig::MAX_BUFFER_SIZE as u64;
                 SubscriptionConfig {
-                    buffer_size: cfg.buffer_size.map(|s| s as usize).unwrap_or(1000),
+                    buffer_size: cfg
+                        .buffer_size
+                        .map(|s| {
+                            napi_args::to_u64_in("bufferSize", s, 1, max_buffer)
+                                .map(|s| s as usize)
+                                .map_err(napi::Error::from_reason)
+                        })
+                        .transpose()?
+                        .unwrap_or(1000),
                     max_snapshot_bytes: cfg
                         .max_snapshot_bytes
-                        .map(|s| s as usize)
+                        .map(|s| js_usize("maxSnapshotBytes", s))
+                        .transpose()?
                         .unwrap_or(10 * 1024 * 1024),
-                    from_sequence: cfg.from_sequence.map(|s| Sequence(s as u64)),
+                    from_sequence: cfg
+                        .from_sequence
+                        .map(|s| js_u64("fromSequence", s).map(Sequence))
+                        .transpose()?,
                     filter: filter.unwrap_or_default(),
                 }
             }
@@ -1357,7 +1446,7 @@ impl JsStore {
     pub fn poll_subscription_timeout(
         &self,
         subscription_id: String,
-        timeout_ms: i64,
+        timeout_ms: f64,
     ) -> Result<Option<JsStoreEvent>> {
         let id: u64 = subscription_id
             .parse()
@@ -1368,7 +1457,7 @@ impl JsStore {
             .get(&id)
             .ok_or_else(|| napi::Error::from_reason("Subscription not found"))?;
 
-        let timeout = std::time::Duration::from_millis(timeout_ms as u64);
+        let timeout = std::time::Duration::from_millis(js_u64("timeoutMs", timeout_ms)?);
         match handle.recv_timeout(timeout) {
             Ok(event) => Ok(Some(event.into())),
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => Ok(None),
@@ -1396,11 +1485,7 @@ impl JsStore {
         entry: JsTreeEntry,
     ) -> Result<JsRecord> {
         let store = self.get_store()?;
-        let tree_entry = TreeEntry {
-            blob_hash: entry.blob_hash,
-            size: entry.size as u64,
-            mode: entry.mode as u32,
-        };
+        let tree_entry = js_tree_entry(entry)?;
         let record = store
             .tree_set(&state_id, &path, &tree_entry)
             .map_err(to_napi_error)?;
@@ -1428,11 +1513,7 @@ impl JsStore {
                         .ok_or_else(|| napi::Error::from_reason("TreeOp 'set' requires entry"))?;
                     Ok(TreeOp::Set {
                         path: op.path,
-                        entry: TreeEntry {
-                            blob_hash: entry.blob_hash,
-                            size: entry.size as u64,
-                            mode: entry.mode as u32,
-                        },
+                        entry: js_tree_entry(entry)?,
                     })
                 }
                 "remove" => Ok(TreeOp::Remove { path: op.path }),
@@ -1490,15 +1571,15 @@ impl JsStore {
     pub fn tree_diff(
         &self,
         state_id: String,
-        from_sequence: i64,
-        to_sequence: i64,
+        from_sequence: f64,
+        to_sequence: f64,
     ) -> Result<Vec<JsTreeChange>> {
         let store = self.get_store()?;
         let changes = store
             .tree_diff(
                 &state_id,
-                Sequence(from_sequence as u64),
-                Sequence(to_sequence as u64),
+                Sequence(js_u64("fromSequence", from_sequence)?),
+                Sequence(js_u64("toSequence", to_sequence)?),
             )
             .map_err(to_napi_error)?;
 
@@ -1612,13 +1693,15 @@ impl JsStore {
         opts: JsIndexRangeQuery,
     ) -> Result<Option<Vec<u32>>> {
         let store = self.get_store()?;
+        let limit = opts.limit.map(|l| js_usize("limit", l)).transpose()?;
+        let offset = opts.offset.map(|o| js_usize("offset", o)).transpose()?;
         Ok(store.query_state_index_range(
             &state_id,
             &field,
             opts.gte,
             opts.lte,
-            opts.limit.map(|l| l as usize),
-            opts.offset.map(|o| o as usize),
+            limit,
+            offset,
             opts.reverse.unwrap_or(false),
         ))
     }
@@ -1637,13 +1720,9 @@ impl JsStore {
         opts: JsIndexEqQuery,
     ) -> Result<Option<Vec<u32>>> {
         let store = self.get_store()?;
-        Ok(store.query_state_index_eq(
-            &state_id,
-            &field,
-            &value,
-            opts.limit.map(|l| l as usize),
-            opts.offset.map(|o| o as usize),
-        ))
+        let limit = opts.limit.map(|l| js_usize("limit", l)).transpose()?;
+        let offset = opts.offset.map(|o| js_usize("offset", o)).transpose()?;
+        Ok(store.query_state_index_eq(&state_id, &field, &value, limit, offset))
     }
 
     /// Distinct values and ordinal counts for a registered string field

@@ -54,10 +54,15 @@ impl BlobStorage {
         fs::create_dir_all(&path)?;
 
         let cache_size = NonZeroUsize::new(cache_size.max(1)).unwrap();
+        // `LruCache::new` reserves room for every entry up front, so a huge
+        // size would ask for more memory than exists, and that failure aborts
+        // the process. Grown as it fills instead.
+        let mut cache = LruCache::unbounded();
+        cache.resize(cache_size);
 
         Ok(Self {
             path,
-            cache: Mutex::new(LruCache::new(cache_size)),
+            cache: Mutex::new(cache),
             entry_synced: AtomicBool::new(false),
             shards: (0..=u8::MAX)
                 .map(|_| ShardDurability {

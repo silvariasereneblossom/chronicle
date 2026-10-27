@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug)]
 pub struct SubscriptionConfig {
     /// Max buffered events before dropping subscriber.
-    /// Default: 1000
+    /// Default: 1000. At most [`SubscriptionConfig::MAX_BUFFER_SIZE`]; a
+    /// larger size is taken as that.
     pub buffer_size: usize,
 
     /// Max bytes for state snapshots (prevents OOM).
@@ -19,6 +20,13 @@ pub struct SubscriptionConfig {
 
     /// Filter criteria.
     pub filter: SubscriptionFilter,
+}
+
+impl SubscriptionConfig {
+    /// The largest buffer a subscription gets. The buffer is allocated whole
+    /// when subscribing, so an unbounded size could ask for more memory than
+    /// exists, and that failure aborts the process.
+    pub const MAX_BUFFER_SIZE: usize = 1 << 20;
 }
 
 impl Default for SubscriptionConfig {

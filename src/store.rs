@@ -512,7 +512,7 @@ impl Store {
         // Note: We may need to fetch more than `limit` if filtering by type
         let fetch_limit = if types.is_some() {
             // Fetch more to account for filtering; will be limited later
-            limit * 4 + 100
+            limit.saturating_mul(4).saturating_add(100)
         } else {
             limit
         };
@@ -525,8 +525,9 @@ impl Store {
             reverse,
         );
 
-        // Read records and filter
-        let mut records = Vec::with_capacity(limit);
+        // Read records and filter. `limit` may be far more than the branch
+        // holds (a caller's "all"), so it bounds the reservation, not sets it.
+        let mut records = Vec::with_capacity(limit.min(offsets.len()));
         for (_seq, offset) in offsets {
             if records.len() >= limit {
                 break;
@@ -3007,6 +3008,34 @@ mod tests {
             let first = 221 - count as i32;
             assert_eq!(arr, (first..=220).collect::<Vec<i32>>(), "tail({count})");
         }
+    }
+
+    #[test]
+    fn test_huge_or_inverted_numbers_dont_panic() {
+        // A number a caller means as "all", or one that arrived unchecked
+        // from JS, used to size an allocation or a range directly, and each
+        // of these panicked, which aborts a Node host (issue #27).
+        let dir = TempDir::new().unwrap();
+        let store = Store::create(StoreConfig {
+            blob_cache_size: usize::MAX,
+            ..test_config(&dir)
+        })
+        .unwrap();
+        let hash = store.store_blob(b"blob", "text/plain").unwrap();
+        assert_eq!(store.get_blob(&hash).unwrap().unwrap().content, b"blob");
+        for i in 1..=5 {
+            let record_type = if i % 2 == 0 { "even" } else { "odd" };
+            store.append(RecordInput::json(record_type, &json!({ "i": i })).unwrap()).unwrap();
+        }
+
+        assert_eq!(store.query_range(None, None, usize::MAX, false, None).unwrap().len(), 5);
+        let even = ["even".to_string()];
+        let found = store.query_range(None, None, usize::MAX, true, Some(&even)).unwrap();
+        assert_eq!(found.iter().map(|r| r.sequence.0).collect::<Vec<_>>(), vec![4, 2]);
+        assert!(store
+            .query_range(Some(Sequence(4)), Some(Sequence(2)), 10, false, None)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

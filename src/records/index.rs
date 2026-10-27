@@ -229,6 +229,11 @@ impl RecordIndex {
 
         let start = (branch, from.unwrap_or(Sequence(0)));
         let end = (branch, to.unwrap_or(Sequence(u64::MAX)));
+        // An empty range: BTreeMap::range panics on one whose start is past
+        // its end.
+        if start > end {
+            return Vec::new();
+        }
 
         if reverse {
             // Iterate backwards from `end` to `start`

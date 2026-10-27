@@ -105,7 +105,8 @@ impl SubscriptionManager {
     /// "caught up" - call `catch_up_subscription` to replay historical data.
     pub fn subscribe(&self, config: SubscriptionConfig) -> SubscriptionHandle {
         let id = SubscriptionId(self.next_id.fetch_add(1, Ordering::SeqCst));
-        let (sender, receiver) = bounded(config.buffer_size);
+        let (sender, receiver) =
+            bounded(config.buffer_size.min(SubscriptionConfig::MAX_BUFFER_SIZE));
 
         let subscription = Subscription {
             config,
@@ -389,6 +390,22 @@ mod tests {
 
         // Subscriber should be dropped
         assert_eq!(manager.subscription_count(), 0);
+    }
+
+    #[test]
+    fn test_huge_buffer_size_is_capped() {
+        // bounded() allocates the whole buffer up front; usize::MAX used to
+        // panic there, which aborts a Node host.
+        let manager = SubscriptionManager::new();
+        let config = SubscriptionConfig {
+            buffer_size: usize::MAX,
+            filter: SubscriptionFilter::records(),
+            ..Default::default()
+        };
+        let handle = manager.subscribe(config);
+        assert_eq!(handle.receiver.capacity(), Some(SubscriptionConfig::MAX_BUFFER_SIZE));
+        manager.mark_caught_up(handle.id).unwrap();
+        assert!(matches!(handle.recv_timeout(Duration::from_millis(50)), Ok(StoreEvent::CaughtUp)));
     }
 
     #[test]

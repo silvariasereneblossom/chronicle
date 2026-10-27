@@ -38,6 +38,7 @@ pub mod branches;
 pub mod error;
 #[cfg(feature = "napi-bindings")]
 pub mod napi;
+mod napi_args;
 pub mod records;
 pub mod state;
 pub mod store;
