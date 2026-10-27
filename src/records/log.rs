@@ -232,6 +232,13 @@ impl RecordLog {
         branch: BranchId,
         sequence: Sequence,
     ) -> Result<(Record, u64)> {
+        Self::check_frame(
+            input.record_type.len(),
+            input.payload.len(),
+            input.caused_by.len(),
+            input.linked_to.len(),
+        )?;
+
         let mut file = self.file.write();
 
         // Assign ID
@@ -275,6 +282,34 @@ impl RecordLog {
         }
 
         Ok((record, offset))
+    }
+
+    /// Refuse a record its frame can't describe, before anything is written:
+    /// `write_record` writes the type's length and the `caused_by` and
+    /// `linked_to` counts as u16 and the payload's length as u32. Cut to fit,
+    /// they would frame the full bytes that follow wrongly, and the next open
+    /// would refuse the log as corrupt.
+    fn check_frame(
+        type_len: usize,
+        payload_len: usize,
+        caused_by: usize,
+        linked_to: usize,
+    ) -> Result<()> {
+        let limits = [
+            ("type", "bytes", type_len, u16::MAX as u64),
+            ("payload", "bytes", payload_len, u32::MAX as u64),
+            ("caused_by", "IDs", caused_by, u16::MAX as u64),
+            ("linked_to", "IDs", linked_to, u16::MAX as u64),
+        ];
+        for (field, unit, len, max) in limits {
+            if len as u64 > max {
+                return Err(StoreError::InvalidOperation(format!(
+                    "a record's {field} is limited to {max} {unit}, and this one has {len}, \
+                     so nothing was written"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// fsync the log file.
@@ -790,6 +825,33 @@ mod tests {
         assert_eq!(record.sequence.0, 1);
         assert_eq!(record.payload, b"hello");
         assert_eq!(offset, 0);
+    }
+
+    // Each frame field's limit, checked by length alone: a payload past
+    // u32::MAX would need a 4 GiB buffer to append. tests/oversized_record.rs
+    // appends past the others and reopens the store.
+    #[test]
+    fn check_frame_refuses_each_length_past_its_field() {
+        let (t, p, c, l) = (
+            u16::MAX as usize,
+            u32::MAX as usize,
+            u16::MAX as usize,
+            u16::MAX as usize,
+        );
+        RecordLog::check_frame(t, p, c, l).unwrap();
+        for (lengths, field) in [
+            ((t + 1, p, c, l), "type"),
+            ((t, p + 1, c, l), "payload"),
+            ((t, p, c + 1, l), "caused_by"),
+            ((t, p, c, l + 1), "linked_to"),
+        ] {
+            match RecordLog::check_frame(lengths.0, lengths.1, lengths.2, lengths.3) {
+                Err(StoreError::InvalidOperation(message)) => {
+                    assert!(message.starts_with(&format!("a record's {field} ")), "{message}")
+                }
+                other => panic!("{field}: {other:?}"),
+            }
+        }
     }
 
     #[test]
