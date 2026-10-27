@@ -1037,12 +1037,17 @@ impl StateManager {
     ///
     /// Used by `create_branch_at` to point a new branch's state head at an
     /// existing position in the parent's chain, without writing new records.
+    /// `has_non_append_since_snapshot` is whether the chain up to that
+    /// position holds an Edit, Redact or Set since its last full snapshot: a
+    /// delta snapshot taken on the branch would walk back past one of those
+    /// and bring back what it removed or replaced.
     pub fn set_head_for_branch(
         &self,
         branch_id: BranchId,
         state_id: &str,
         head_offset: u64,
         item_count: usize,
+        has_non_append_since_snapshot: bool,
     ) {
         let mut index = self.index.write();
 
@@ -1053,7 +1058,7 @@ impl StateManager {
             delta_snapshots_since_full: 0,
             last_delta_snapshot_offset: None,
             last_full_snapshot_offset: None,
-            has_non_append_since_snapshot: false,
+            has_non_append_since_snapshot,
             item_count,
             // No record is written here — this head aliases into the parent's
             // chain. The branch starts at size N with the parent's snapshots
@@ -1177,6 +1182,18 @@ impl StateManager {
     /// Get all registered state IDs.
     pub fn state_ids(&self) -> Vec<String> {
         self.index.read().strategies.keys().cloned().collect()
+    }
+
+    /// IDs of the states with a chain head on `branch_id`: every state that
+    /// branch has written or inherited, registered or not.
+    pub fn state_ids_on_branch(&self, branch_id: BranchId) -> Vec<String> {
+        self.index
+            .read()
+            .heads
+            .keys()
+            .filter(|(branch, _)| *branch == branch_id)
+            .map(|(_, state_id)| state_id.clone())
+            .collect()
     }
 
     /// Get count of registered states.

@@ -1166,6 +1166,108 @@ fn test_create_branch_at_after_compaction() {
     assert_eq!(data, vec!["item1", "item2", "item3", "item4"]);
 }
 
+/// An append-log state of items 0..5 at the default cadence, which takes its
+/// first delta snapshot after 100 operations.
+fn store_with_five_items(dir: &TempDir) -> Store {
+    let store = test_store(dir);
+    store
+        .register_state(StateRegistration {
+            id: "items".to_string(),
+            strategy: StateStrategy::AppendLog {
+                delta_snapshot_every: 100,
+                full_snapshot_every: 10,
+            },
+            initial_value: None,
+        })
+        .unwrap();
+    for i in 0..5 {
+        store
+            .update_state("items", StateOperation::Append(serde_json::to_vec(&i).unwrap()))
+            .unwrap();
+    }
+    store
+}
+
+/// Applies `op` on main, branches at main's head, and appends 100 items on
+/// the branch, enough for its first delta snapshot to come due. A delta
+/// gathers only the Appends since the last snapshot and reads skip the raw
+/// operations behind it, so a delta taken here would walk back past `op` and
+/// bring back what it removed or replaced. The branch must read `before`
+/// followed by the new items, and count them.
+fn assert_branch_keeps(store: &Store, op: StateOperation, before: Vec<serde_json::Value>) {
+    store.update_state("items", op).unwrap();
+    let at = store.current_branch().head;
+    store.create_branch_at("fork", "main", at).unwrap();
+    store.switch_branch("fork").unwrap();
+    let mut expected = before;
+    for i in 100..200 {
+        store
+            .update_state("items", StateOperation::Append(serde_json::to_vec(&i).unwrap()))
+            .unwrap();
+        expected.push(serde_json::json!(i));
+    }
+    let value: Vec<serde_json::Value> =
+        serde_json::from_slice(&store.get_state("items").unwrap().unwrap()).unwrap();
+    assert_eq!(value, expected);
+    assert_eq!(store.get_state_len("items").unwrap(), Some(expected.len()));
+}
+
+#[test]
+fn test_create_branch_at_after_redact_keeps_it_redacted() {
+    let dir = TempDir::new().unwrap();
+    let store = store_with_five_items(&dir);
+    assert_branch_keeps(
+        &store,
+        StateOperation::Redact { start: 0, end: 2 },
+        vec![2.into(), 3.into(), 4.into()],
+    );
+}
+
+#[test]
+fn test_create_branch_at_after_edit_keeps_the_edit() {
+    let dir = TempDir::new().unwrap();
+    let store = store_with_five_items(&dir);
+    assert_branch_keeps(
+        &store,
+        StateOperation::Edit {
+            index: 0,
+            new_value: b"\"edited\"".to_vec(),
+        },
+        vec!["edited".into(), 1.into(), 2.into(), 3.into(), 4.into()],
+    );
+}
+
+#[test]
+fn test_create_branch_at_after_set_keeps_the_set() {
+    let dir = TempDir::new().unwrap();
+    let store = store_with_five_items(&dir);
+    assert_branch_keeps(
+        &store,
+        StateOperation::Set(b"[\"replaced\"]".to_vec()),
+        vec!["replaced".into()],
+    );
+}
+
+#[test]
+fn test_create_branch_at_copies_states_written_without_registration() {
+    // create_branch copies every state the parent has written, registered or
+    // not, and create_branch_at must too.
+    let dir = TempDir::new().unwrap();
+    let store = test_store(&dir);
+    store
+        .update_state("watermark", StateOperation::Set(b"7".to_vec()))
+        .unwrap(); // seq 1
+    store
+        .update_state("watermark", StateOperation::Set(b"8".to_vec()))
+        .unwrap(); // seq 2
+
+    store
+        .create_branch_at("at-seq-1", "main", chronicle::Sequence(1))
+        .unwrap();
+    store.switch_branch("at-seq-1").unwrap();
+    assert_eq!(store.get_state("watermark").unwrap(), Some(b"7".to_vec()));
+}
+
 // =============================================================================
 // BRANCH DELETION TESTS
 // =============================================================================

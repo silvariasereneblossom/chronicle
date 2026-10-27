@@ -873,17 +873,20 @@ impl Store {
         Ok(Some(state))
     }
 
-    /// Find the chain head info (offset and item count) at a historical sequence.
+    /// Find the chain head info (offset, item count, and whether an Edit,
+    /// Redact or Set came since the last full snapshot) at a historical
+    /// sequence.
     ///
     /// Used by `create_branch_at` to point a new branch at an existing chain position
-    /// without writing new records. Returns `(head_offset, item_count)` or None if
-    /// no state existed at that sequence.
+    /// without writing new records. Returns `(head_offset, item_count,
+    /// has_non_append_since_snapshot)` or None if no state existed at that
+    /// sequence.
     fn find_chain_info_at(
         &self,
         branch_id: crate::types::BranchId,
         state_id: &str,
         at_sequence: Sequence,
-    ) -> Result<Option<(u64, usize)>> {
+    ) -> Result<Option<(u64, usize, bool)>> {
         let head = match self.state.get_head(branch_id, state_id) {
             Some(h) => h,
             None => return Ok(None),
@@ -894,6 +897,9 @@ impl Store {
         let mut found_offset: Option<u64> = None;
         let mut operations = Vec::new();
         let mut hit_snapshot = false;
+        // As `record_update` keeps it: set by an Edit, Redact or Set, and
+        // cleared only by a full snapshot, where this walk stops.
+        let mut has_non_append = false;
 
         while let Some(offset) = current_offset {
             let record = self.log.read_at(offset)?;
@@ -909,6 +915,13 @@ impl Store {
             // This is the first record at or before target - it becomes our head
             if found_offset.is_none() {
                 found_offset = Some(offset);
+            }
+
+            if matches!(
+                update.operation,
+                StateOperation::Edit { .. } | StateOperation::Redact { .. } | StateOperation::Set(_)
+            ) {
+                has_non_append = true;
             }
 
             // Collect operations to compute item_count
@@ -962,7 +975,7 @@ impl Store {
             }
         };
 
-        Ok(Some((head_offset, item_count)))
+        Ok(Some((head_offset, item_count, has_non_append)))
     }
 
     /// Get the length of an AppendLog state without loading all items.
@@ -1884,18 +1897,25 @@ impl Store {
         if at > parent.head {
             return Err(StoreError::InvalidSequence(at, parent.head));
         }
+        // Every state the parent has written, registered or not, as
+        // `create_branch` copies them.
         let mut heads = Vec::new();
-        for state_id in self.state.state_ids() {
-            if let Some((head_offset, item_count)) =
+        for state_id in self.state.state_ids_on_branch(parent.id) {
+            if let Some((head_offset, item_count, has_non_append)) =
                 self.find_chain_info_at(parent.id, &state_id, at)?
             {
-                heads.push((state_id, head_offset, item_count));
+                heads.push((state_id, head_offset, item_count, has_non_append));
             }
         }
         let new_branch = self.branches.create_branch_at(name, from, at)?;
-        for (state_id, head_offset, item_count) in heads {
-            self.state
-                .set_head_for_branch(new_branch.id, &state_id, head_offset, item_count);
+        for (state_id, head_offset, item_count, has_non_append) in heads {
+            self.state.set_head_for_branch(
+                new_branch.id,
+                &state_id,
+                head_offset,
+                item_count,
+                has_non_append,
+            );
         }
 
         write.checkpoint_required = true;
