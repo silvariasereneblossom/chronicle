@@ -478,13 +478,19 @@ impl Store {
         self.index.get_by_type(record_type)
     }
 
-    /// Iterate records from a sequence.
+    /// Iterate the log from the current branch's first record at or after
+    /// `seq`, or from the end when it has none, to the end. Records of other
+    /// branches in that stretch are included.
     pub fn iter_from(&self, seq: Sequence) -> impl Iterator<Item = Result<(u64, Record)>> + '_ {
         let branch = self.branches.current_branch();
+        // Not only an exact match: a sequence with no record of its own,
+        // such as the next one, used to start the scan at offset 0.
         let offset = self
             .index
-            .get_offset(branch.id, seq)
-            .unwrap_or(0);
+            .query_range(branch.id, Some(seq), None, 1, false)
+            .first()
+            .map(|&(_, offset)| offset)
+            .unwrap_or_else(|| self.log.size());
         self.log.iter_from(offset)
     }
 
@@ -2289,8 +2295,8 @@ impl Store {
             for result in self.iter_from(from_seq) {
                 let (_offset, record) = result?;
 
-                // Skip records not on current branch
-                if record.branch != current_branch.id {
+                // Skip records not on current branch, or before the start
+                if record.branch != current_branch.id || record.sequence < from_seq {
                     continue;
                 }
 
@@ -3345,6 +3351,44 @@ mod tests {
         }
 
         assert_eq!(received, vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn test_subscription_catch_up_from_a_sequence_with_no_record() {
+        use crate::subscriptions::{SubscriptionConfig, SubscriptionFilter, StoreEvent};
+        use std::time::Duration;
+
+        // A live-from-now subscriber starts at the next sequence, which no
+        // record holds yet. Its catch-up used to start at the beginning of
+        // the log and replay the whole branch, overflowing a small buffer.
+        let dir = TempDir::new().unwrap();
+        let store = Store::create(test_config(&dir)).unwrap();
+        for i in 1..=5 {
+            store
+                .append(RecordInput::json("message", &serde_json::json!({ "i": i })).unwrap())
+                .unwrap();
+        }
+
+        let config = SubscriptionConfig {
+            buffer_size: 2,
+            filter: SubscriptionFilter::records(),
+            from_sequence: Some(store.current_branch().head.next()),
+            ..Default::default()
+        };
+        let handle = store.subscribe(config);
+        store.catch_up_subscription(handle.id).unwrap();
+
+        let event = handle.recv_timeout(Duration::from_millis(100)).unwrap();
+        assert!(matches!(event, StoreEvent::CaughtUp), "{event:?}");
+
+        // Live records still arrive.
+        store
+            .append(RecordInput::json("message", &serde_json::json!({ "i": 6 })).unwrap())
+            .unwrap();
+        match handle.recv_timeout(Duration::from_millis(100)).unwrap() {
+            StoreEvent::Record { record } => assert_eq!(record.sequence, Sequence(6)),
+            other => panic!("expected the live record, got {other:?}"),
+        }
     }
 
     #[test]
