@@ -769,13 +769,35 @@ impl BranchManager {
         // Read index
         let mut len_bytes = [0u8; 8];
         file.read_exact(&mut len_bytes)?;
-        let len = u64::from_le_bytes(len_bytes) as usize;
+        let len = u64::from_le_bytes(len_bytes);
 
-        let mut encoded = vec![0u8; len];
+        // Check the length against the bytes that follow before allocating,
+        // as the field-index loader does: a cut-short or damaged file can
+        // name any length up to u64::MAX.
+        let remaining = file.metadata()?.len().saturating_sub(4 + 1 + 8 + 8);
+        if len > remaining {
+            return Err(StoreError::Corruption(format!(
+                "{} names {} bytes of branch index, and only {} follow (cut short or damaged)",
+                self.path.display(),
+                len,
+                remaining
+            )));
+        }
+
+        let mut encoded = vec![0u8; len as usize];
         file.read_exact(&mut encoded)?;
 
         let index: BranchIndex = rmp_serde::from_slice(&encoded)
             .map_err(|e| StoreError::Deserialization(e.to_string()))?;
+
+        // current_branch() expects the current branch to exist.
+        if !index.branches.contains_key(&current_id) {
+            return Err(StoreError::Corruption(format!(
+                "{} names branch {} as current, and holds no such branch",
+                self.path.display(),
+                current_id.0
+            )));
+        }
 
         *self.index.write() = index;
 
@@ -945,6 +967,50 @@ mod tests {
             let main = manager.get_branch(MAIN_BRANCH).unwrap();
             assert_eq!(main.head, Sequence(5));
         }
+    }
+
+    /// Load `bytes` as branches.bin, which must be refused as corrupt.
+    fn assert_load_refused(path: &Path, name: &str, bytes: Vec<u8>) {
+        std::fs::write(path, bytes).unwrap();
+        match BranchManager::load(path) {
+            Err(StoreError::Corruption(message)) => {
+                assert!(message.contains("branches.bin"), "{name}: {message}")
+            }
+            Err(other) => panic!("{name}: expected Corruption, got {other:?}"),
+            Ok(_) => panic!("{name}: loaded"),
+        }
+    }
+
+    #[test]
+    fn test_load_refuses_a_length_past_the_file() {
+        // u64::MAX used to reach `vec![0u8; len]`, which panics.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("branches.bin");
+        let manager = BranchManager::new(&path).unwrap();
+        manager.create_branch("feature", None).unwrap();
+        manager.save().unwrap();
+        let saved = std::fs::read(&path).unwrap();
+        let header = BRANCH_INDEX_MAGIC.len() + 1 + 8 + 8;
+
+        let mut cut_short = saved.clone();
+        cut_short.truncate(saved.len() - 3);
+        assert_load_refused(&path, "cut short", cut_short);
+        let mut huge = saved[..header - 8].to_vec();
+        huge.extend_from_slice(&u64::MAX.to_le_bytes());
+        huge.extend_from_slice(&saved[header..]);
+        assert_load_refused(&path, "u64::MAX length", huge);
+    }
+
+    #[test]
+    fn test_load_refuses_a_current_branch_it_does_not_hold() {
+        // current_branch() used to panic on the first call after such a load.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("branches.bin");
+        BranchManager::new(&path).unwrap().save().unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let current = BRANCH_INDEX_MAGIC.len() + 1;
+        bytes[current..current + 8].copy_from_slice(&99u64.to_le_bytes());
+        assert_load_refused(&path, "current branch 99", bytes);
     }
 
     #[test]

@@ -1364,9 +1364,23 @@ impl StateManager {
         // Read index
         let mut len_bytes = [0u8; 8];
         file.read_exact(&mut len_bytes)?;
-        let len = u64::from_le_bytes(len_bytes) as usize;
+        let len = u64::from_le_bytes(len_bytes);
 
-        let mut encoded = vec![0u8; len];
+        // Check the length against the bytes that follow before allocating,
+        // as the field-index loader does: a cut-short or damaged file can
+        // name any length up to u64::MAX. Unlike that index, state.bin is
+        // load-bearing, so this is an error rather than a fresh start.
+        let remaining = file.metadata()?.len().saturating_sub(4 + 1 + 8);
+        if len > remaining {
+            return Err(StoreError::Corruption(format!(
+                "{} names {} bytes of state index, and only {} follow (cut short or damaged)",
+                self.path.display(),
+                len,
+                remaining
+            )));
+        }
+
+        let mut encoded = vec![0u8; len as usize];
         file.read_exact(&mut encoded)?;
 
         let index: StateIndex = rmp_serde::from_slice(&encoded)
@@ -1729,6 +1743,43 @@ mod tests {
 
             let state = manager.get_state(TEST_BRANCH, "test").unwrap().unwrap();
             assert_eq!(state, b"\"persisted\"");
+        }
+    }
+
+    #[test]
+    fn test_load_refuses_a_length_past_the_file() {
+        // A cut-short or damaged state.bin whose length field names more
+        // than the file holds must be refused as corrupt before allocating:
+        // u64::MAX used to reach `vec![0u8; len]`, which panics.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.bin");
+        let manager = StateManager::new(&path).unwrap();
+        manager
+            .register_state(StateRegistration {
+                id: "test".to_string(),
+                strategy: StateStrategy::Snapshot,
+                initial_value: None,
+            })
+            .unwrap();
+        manager.save().unwrap();
+        let saved = std::fs::read(&path).unwrap();
+        let header = STATE_INDEX_MAGIC.len() + 1 + 8;
+
+        let mut cut_short = saved.clone();
+        cut_short.truncate(saved.len() - 3);
+        let mut huge = saved[..header - 8].to_vec();
+        huge.extend_from_slice(&u64::MAX.to_le_bytes());
+        huge.extend_from_slice(&saved[header..]);
+
+        for (name, bytes) in [("cut short", cut_short), ("u64::MAX length", huge)] {
+            std::fs::write(&path, bytes).unwrap();
+            match StateManager::load(&path) {
+                Err(StoreError::Corruption(message)) => {
+                    assert!(message.contains("state.bin"), "{name}: {message}")
+                }
+                Err(other) => panic!("{name}: expected Corruption, got {other:?}"),
+                Ok(_) => panic!("{name}: loaded"),
+            }
         }
     }
 
