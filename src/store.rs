@@ -605,14 +605,15 @@ impl Store {
     /// Update a state and record it.
     ///
     /// The operation is checked against what the index holds, not applied,
-    /// before it's recorded: an Edit's index against the state's length, and a
-    /// Tree operation against its strategy. Other operations are recorded as
-    /// given, and one that can't be applied, such as an Append of bytes that
-    /// aren't JSON, shows when the state is next materialized. That can be
-    /// this call's own auto-snapshot, so an error can come back for an
-    /// operation already recorded (issue #39).
+    /// before it's recorded: an Edit's index against the state's length, a
+    /// Tree operation against its strategy, the bytes of an Append or Edit
+    /// that they parse as JSON, and an AppendLog state's Set that it's a
+    /// JSON array. Other operations are recorded as given.
     ///
-    /// Snapshots are automatically created when thresholds are reached.
+    /// Snapshots are automatically created when thresholds are reached. Once
+    /// the update is recorded this returns it, even if that snapshot fails:
+    /// the failure is logged, and the next update of the state tries again
+    /// (issue #39).
     pub fn update_state(
         &self,
         state_id: &str,
@@ -701,18 +702,36 @@ impl Store {
         let operation = operation_builder(next_id, next_seq)?;
 
         // Validate operation WITHOUT loading full state (critical for 50M+ operations)
-        // - Append: Always succeeds, no validation needed
-        // - Edit: Just check index < len
+        // - Append: Its item must parse as JSON
+        // - Edit: Check index < len, and its new value must parse as JSON
         // - Redact: No validation: when it's applied, a range past the end is
         //   clamped to the length and a reversed one removes nothing
-        // - Set/Snapshot/DeltaSnapshot: No validation needed
+        // - Set: An AppendLog state's must parse as a JSON array
+        // - Snapshot/DeltaSnapshot: No validation needed
+        // Materializing the state parses those bytes, so a record of ones that
+        // don't parse would make every later read of the state fail.
         match &operation {
-            StateOperation::Edit { index, .. } => {
+            StateOperation::Append(item) => check_json("Append", item)?,
+            StateOperation::Edit { index, new_value } => {
                 let len = self.get_state_len(state_id)?.unwrap_or(0);
                 if *index >= len {
                     return Err(StoreError::InvalidOperation(format!(
                         "Edit index {} out of bounds (len={})",
                         index, len
+                    )));
+                }
+                check_json("Edit", new_value)?;
+            }
+            StateOperation::Set(value)
+                if matches!(
+                    self.state.get_strategy(state_id),
+                    Some(crate::types::StateStrategy::AppendLog { .. })
+                ) =>
+            {
+                if let Err(e) = serde_json::from_slice::<Vec<serde_json::Value>>(value) {
+                    return Err(StoreError::InvalidOperation(format!(
+                        "an append-log state can only be Set to a JSON array ({e}), \
+                         so nothing was recorded"
                     )));
                 }
             }
@@ -736,7 +755,7 @@ impl Store {
                     )));
                 }
             }
-            // Append, Set, Snapshot, DeltaSnapshot, TreeDeltaSnapshot - no validation needed
+            // Other Sets, Snapshot, DeltaSnapshot, TreeDeltaSnapshot - no validation needed
             _ => {}
         }
 
@@ -793,7 +812,17 @@ impl Store {
         if !skip_auto_snapshot && self.auto_snapshot_enabled.load(Ordering::Relaxed) {
             // Drop the lock before calling auto_snapshot to avoid deadlock
             drop(write);
-            self.auto_snapshot_if_needed(state_id)?;
+            // The update is committed, so a failed snapshot mustn't report it
+            // as failed: a caller would retry and record it twice. Its
+            // thresholds stay met, so the next update of the state retries.
+            if let Err(error) = self.auto_snapshot_if_needed(state_id) {
+                tracing::warn!(
+                    state = %state_id,
+                    %error,
+                    "automatic snapshot after a committed state update failed; \
+                     the next update of this state tries it again"
+                );
+            }
         }
 
         Ok(record)
@@ -2370,6 +2399,18 @@ fn existing_store_file(path: &Path) -> Option<&'static str> {
     ["MANIFEST", "records.log", "state.bin", "branches.bin"]
         .into_iter()
         .find(|name| fs::symlink_metadata(path.join(name)).is_ok())
+}
+
+/// Refuse a state operation's bytes that don't parse as JSON, as
+/// materializing the state parses them.
+fn check_json(operation: &str, bytes: &[u8]) -> Result<()> {
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .map(drop)
+        .map_err(|e| {
+            StoreError::InvalidOperation(format!(
+                "{operation} of bytes that aren't JSON ({e}), so nothing was recorded"
+            ))
+        })
 }
 
 /// What a failed `try_lock_exclusive` on LOCK means. fs2 reports another

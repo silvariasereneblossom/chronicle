@@ -219,13 +219,15 @@ fn test_invalid_json_in_append() {
         })
         .unwrap();
 
-    // Invalid JSON succeeds at write time (lazy validation for performance)
-    // but fails on reconstruction/read
-    store.update_state("items", StateOperation::Append(b"not valid json".to_vec())).unwrap();
+    store.update_state("items", StateOperation::Append(b"1".to_vec())).unwrap();
 
-    // Reading the state should fail during reconstruction
-    let result = store.get_state("items");
-    assert!(matches!(result, Err(StoreError::Deserialization(_))));
+    // Invalid JSON is refused at write time: recorded, it would make every
+    // later read of the state fail.
+    let result = store.update_state("items", StateOperation::Append(b"not valid json".to_vec()));
+    assert!(matches!(result, Err(StoreError::InvalidOperation(_))));
+
+    // The state still reads
+    assert_eq!(store.get_state("items").unwrap().unwrap(), b"[1]");
 }
 
 // --- Boundary Conditions ---

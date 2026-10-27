@@ -827,7 +827,8 @@ impl JsStore {
         }
     }
 
-    /// Set state value (for Snapshot strategy).
+    /// Set state value (for Snapshot strategy). On an `append_log` state the
+    /// value must be a JSON array; anything else throws and records nothing.
     #[napi]
     pub fn set_state(&self, state_id: String, value: Buffer) -> Result<JsRecord> {
         let store = self.get_store()?;
@@ -837,7 +838,8 @@ impl JsStore {
         Ok(record.into())
     }
 
-    /// Set state as JSON.
+    /// Set state as JSON. On an `append_log` state the value must be an
+    /// array; anything else throws and records nothing.
     #[napi]
     pub fn set_state_json(&self, state_id: String, value: serde_json::Value) -> Result<JsRecord> {
         let store = self.get_store()?;
@@ -849,7 +851,8 @@ impl JsStore {
         Ok(record.into())
     }
 
-    /// Append to an AppendLog state.
+    /// Append to an AppendLog state. Throws, recording nothing, if `item`
+    /// isn't JSON.
     #[napi]
     pub fn append_to_state(&self, state_id: String, item: Buffer) -> Result<JsRecord> {
         let store = self.get_store()?;
@@ -899,7 +902,8 @@ impl JsStore {
         Ok(record.into())
     }
 
-    /// Edit an item in an AppendLog state.
+    /// Edit an item in an AppendLog state. Throws, recording nothing, if
+    /// `newValue` isn't JSON (such as JSON escaping a lone surrogate half).
     #[napi]
     pub fn edit_state_item(
         &self,

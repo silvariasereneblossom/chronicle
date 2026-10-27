@@ -311,13 +311,15 @@ fn failed_historical_chain_read_does_not_allocate_a_partial_branch() {
     let dir = TempDir::new().unwrap();
     let store = Store::create(config(dir.path())).unwrap();
     store.register_state(registration("items")).unwrap();
-    // The append fast path accepts these bytes, but this malformed payload
-    // cannot be materialized while preparing the historical branch's count.
+    // A Snapshot's bytes aren't checked at write, so this malformed one is
+    // recorded, and the Append after it can't be materialized while
+    // preparing the historical branch's count.
     store
-        .update_state("items", StateOperation::Append(b"not-json".to_vec()))
+        .update_state("items", StateOperation::Snapshot(b"not-json".to_vec()))
         .unwrap();
+    append(&store, 1).unwrap();
     let err = store
-        .create_branch_at("bad", "main", Sequence(1))
+        .create_branch_at("bad", "main", Sequence(2))
         .unwrap_err();
     assert!(matches!(err, StoreError::Deserialization(_)), "{err}");
     assert_eq!(store.list_branches().len(), 1);
