@@ -1067,6 +1067,7 @@ impl Store {
         let mut items_collected: Vec<serde_json::Value> = Vec::new();
         let mut current_offset = Some(head.head_offset);
         let mut need_full_reconstruct = false;
+        let mut hit_snapshot = false;
 
         while let Some(offset) = current_offset {
             if items_collected.len() >= count {
@@ -1077,6 +1078,12 @@ impl Store {
             let update = StateUpdateRecord::decode(&record)?;
 
             match &update.operation {
+                // A delta snapshot already taken from holds the Appends behind
+                // it; skip the raw operations there, as the other walkers do.
+                StateOperation::Append(_)
+                | StateOperation::Edit { .. }
+                | StateOperation::Redact { .. }
+                    if hit_snapshot => {}
                 StateOperation::Append(item) => {
                     let value: serde_json::Value = serde_json::from_slice(item)
                         .map_err(|e| StoreError::Deserialization(e.to_string()))?;
@@ -1094,6 +1101,7 @@ impl Store {
                             break;
                         }
                     }
+                    hit_snapshot = true;
                 }
                 StateOperation::Snapshot(data) => {
                     let arr: Vec<serde_json::Value> = serde_json::from_slice(data)
@@ -2943,6 +2951,37 @@ mod tests {
         let tail = store.get_state_tail("items", 0).unwrap().unwrap();
         let arr: Vec<i32> = serde_json::from_slice(&tail).unwrap();
         assert_eq!(arr, Vec::<i32>::new());
+    }
+
+    #[test]
+    fn test_get_state_tail_across_delta_snapshots() {
+        // At the default cadence, 220 appends leave delta snapshots of items
+        // 1..=100 and 101..=200 with 201..=220 raw after them. A tail that
+        // reaches into a delta must not then also take the Appends the delta
+        // already holds.
+        let dir = TempDir::new().unwrap();
+        let store = Store::create(test_config(&dir)).unwrap();
+        store.register_state(StateRegistration {
+            id: "items".to_string(),
+            strategy: crate::types::StateStrategy::AppendLog {
+                delta_snapshot_every: 100,
+                full_snapshot_every: 10,
+            },
+            initial_value: None,
+        }).unwrap();
+        for i in 1..=220 {
+            store.update_state("items", StateOperation::Append(
+                serde_json::to_vec(&i).unwrap()
+            )).unwrap();
+        }
+        assert_eq!(store.get_compaction_stats("items").unwrap().delta_snapshots_since_full, 2);
+
+        for count in [150, 205] {
+            let tail = store.get_state_tail("items", count).unwrap().unwrap();
+            let arr: Vec<i32> = serde_json::from_slice(&tail).unwrap();
+            let first = 221 - count as i32;
+            assert_eq!(arr, (first..=220).collect::<Vec<i32>>(), "tail({count})");
+        }
     }
 
     #[test]
