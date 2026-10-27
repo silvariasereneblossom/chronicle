@@ -62,6 +62,11 @@ const STORE_MAGIC: &[u8; 4] = b"RST\0";
 /// Current store format version.
 const STORE_VERSION: u8 = 1;
 
+/// Most index entries `query_range` takes at a time while a type filter
+/// passes over records, so a huge limit doesn't collect the whole branch's
+/// entries at once.
+const TYPE_FILTER_PAGE: usize = 4096;
+
 /// Admission state protected by the store's write mutex.
 #[derive(Default)]
 struct WriteState {
@@ -501,7 +506,8 @@ impl Store {
     /// - `to`: End sequence (inclusive), None for end
     /// - `limit`: Maximum records to return
     /// - `reverse`: If true, return records in descending sequence order
-    /// - `types`: Optional record type filter (applied after fetching)
+    /// - `types`: Optional record type filter (applied after fetching, until
+    ///   `limit` records match or the range runs out)
     ///
     /// Returns records matching the criteria.
     pub fn query_range(
@@ -513,42 +519,63 @@ impl Store {
         types: Option<&[String]>,
     ) -> Result<Vec<Record>> {
         let branch = self.branches.current_branch();
+        let (mut from, mut to) = (from, to);
+        let mut records = Vec::new();
 
-        // Get offsets from index
-        // Note: We may need to fetch more than `limit` if filtering by type
-        let fetch_limit = if types.is_some() {
-            // Fetch more to account for filtering; will be limited later
-            limit.saturating_mul(4).saturating_add(100)
-        } else {
-            limit
-        };
+        // Without a type filter the first page is the answer. With one, any
+        // number of records can fail it, so page through the range until
+        // `limit` match or it runs out.
+        loop {
+            let wanted = limit - records.len();
+            let page = if types.is_some() {
+                // Fetch more to account for filtering
+                wanted.saturating_mul(4).saturating_add(100).min(TYPE_FILTER_PAGE)
+            } else {
+                wanted
+            };
 
-        let offsets = self.index.query_range(
-            branch.id,
-            from,
-            to,
-            fetch_limit,
-            reverse,
-        );
+            let offsets = self.index.query_range(branch.id, from, to, page, reverse);
+            let range_done = offsets.len() < page;
+            let last_seq = offsets.last().map(|&(seq, _)| seq);
 
-        // Read records and filter. `limit` may be far more than the branch
-        // holds (a caller's "all"), so it bounds the reservation, not sets it.
-        let mut records = Vec::with_capacity(limit.min(offsets.len()));
-        for (_seq, offset) in offsets {
-            if records.len() >= limit {
-                break;
-            }
-
-            let record = self.log.read_at(offset)?;
-
-            // Apply type filter if specified
-            if let Some(types) = types {
-                if !types.contains(&record.record_type) {
-                    continue;
+            // Read records and filter. `limit` may be far more than the
+            // branch holds (a caller's "all"), so it bounds the reservation,
+            // not sets it.
+            records.reserve(wanted.min(offsets.len()));
+            for (_seq, offset) in offsets {
+                if records.len() >= limit {
+                    break;
                 }
+
+                let record = self.log.read_at(offset)?;
+
+                // Apply type filter if specified
+                if let Some(types) = types {
+                    if !types.contains(&record.record_type) {
+                        continue;
+                    }
+                }
+
+                records.push(record);
             }
 
-            records.push(record);
+            // Continue past the last sequence this page read.
+            match last_seq {
+                Some(seq) if records.len() < limit && !range_done => {
+                    if reverse {
+                        match seq.0.checked_sub(1) {
+                            Some(prev) => to = Some(Sequence(prev)),
+                            None => break,
+                        }
+                    } else {
+                        match seq.0.checked_add(1) {
+                            Some(next) => from = Some(Sequence(next)),
+                            None => break,
+                        }
+                    }
+                }
+                _ => break,
+            }
         }
 
         Ok(records)
@@ -3083,6 +3110,35 @@ mod tests {
             .query_range(Some(Sequence(4)), Some(Sequence(2)), 10, false, None)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn test_query_range_finds_a_rare_type_past_the_first_window() {
+        // 1000 records, every 200th of type "rare". The type filter used to
+        // look only at the first limit * 4 + 100 records of the range.
+        let dir = TempDir::new().unwrap();
+        let store = Store::create(test_config(&dir)).unwrap();
+        for i in 1..=1000u64 {
+            let record_type = if i % 200 == 100 { "rare" } else { "common" };
+            store.append(RecordInput::json(record_type, &json!({ "i": i })).unwrap()).unwrap();
+        }
+        let rare = ["rare".to_string()];
+        let sequences = |from: Option<u64>, to: Option<u64>, limit: usize, reverse: bool| {
+            store
+                .query_range(from.map(Sequence), to.map(Sequence), limit, reverse, Some(&rare))
+                .unwrap()
+                .iter()
+                .map(|r| r.sequence.0)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(sequences(None, None, 5, false), vec![100, 300, 500, 700, 900]);
+        assert_eq!(sequences(None, None, 10, false), vec![100, 300, 500, 700, 900]);
+        assert_eq!(sequences(None, None, 3, false), vec![100, 300, 500]);
+        assert_eq!(sequences(None, None, 2, true), vec![900, 700]);
+        assert_eq!(sequences(Some(301), None, 10, false), vec![500, 700, 900]);
+        assert_eq!(sequences(None, Some(699), 10, true), vec![500, 300, 100]);
+        assert_eq!(sequences(None, None, 0, false), Vec::<u64>::new());
     }
 
     #[test]
